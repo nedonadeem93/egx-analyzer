@@ -441,15 +441,28 @@ ALL_STOCKS = []
 
 def scan_market():
     global SYMBOL_DESC
-    q = (Query().set_markets("egypt")
-         .select("name", "description", "close", "change", "volume", "type"))
+
+    def _run(cols):
+        q = (Query().set_markets("egypt").select(*cols))
+        try:
+            q = q.limit(500)
+        except Exception:
+            pass
+        return q.get_scanner_data()
+
     try:
-        q = q.limit(500)
+        _, df = _run(["name", "description", "close", "change", "volume",
+                      "average_volume_10d_calc", "type"])
     except Exception:
-        pass
-    _, df = q.get_scanner_data()
+        try:
+            _, df = _run(["name", "description", "close", "change",
+                          "volume", "type"])
+        except Exception:
+            return pd.DataFrame()
+
     if df is None or df.empty:
         return pd.DataFrame()
+
     df = df.reset_index(drop=True)
     if "type" in df.columns:
         df = df[df["type"] == "stock"]
@@ -466,9 +479,19 @@ def scan_market():
     if "volume" not in df.columns:
         df["volume"] = 0.0
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+
+    # متوسط كميات 10 أيام — مفيش تصفير بالليل، فلتر عادل
+    if "average_volume_10d_calc" in df.columns:
+        df["avg_vol"] = pd.to_numeric(df["average_volume_10d_calc"],
+                                      errors="coerce").fillna(0)
+    else:
+        df["avg_vol"] = 0.0
+
     if "change" not in df.columns:
         df["change"] = 0.0
-    return df.rename(columns={"name": "sym"})[["sym", "close", "change", "volume"]]
+
+    return df.rename(columns={"name": "sym"})[["sym", "close", "change",
+                                               "volume", "avg_vol"]]
 
 FALLBACK_STOCKS = ["COMI", "ABUK", "HRHO", "ETEL", "TMGH", "SWDY",
                    "EAST", "ORHD", "ADIB", "KIMA", "EFID", "PHDC",
@@ -503,7 +526,8 @@ def scan_fallback_list(symbols):
             v20 = (df["Close"] * df["Volume"]).rolling(20).mean().dropna()
             avg20 = float(v20.iloc[-1]) if len(v20) else px * vol
             chg = (px / float(df["Close"].iloc[-2]) - 1) * 100 if len(df) > 1 else 0
-            rows.append(dict(sym=s, close=px, change=chg, volume=vol, value=avg20))
+            rows.append(dict(sym=s, close=px, change=chg, volume=vol,
+                             avg_vol=0.0, value=avg20))
         except Exception:
             continue
     return pd.DataFrame(rows)
@@ -514,11 +538,20 @@ def deep_row(sym, price, vol_today):
         if df is None:
             return None
         df, _ = data_quality_check(df)
-        if vol_today and vol_today > 0:
+        if df is None or len(df) < 2:
+            return None
+
+        hist_last = float(df["Close"].iloc[-1])
+        price = float(price)
+
+        # الإصلاح: بنقارن سعر السكانر بآخر إغلاق تاريخي —
+        # لو نفس الرقم يبقى مفيش تداول جديد (ليل) ومنضيفش شمعة وهمية
+        if price > 0 and hist_last > 0 and abs(price - hist_last) / hist_last > 0.0005:
             df = patch_live(df.copy(), price)
         else:
             df = df.copy()
-            price = float(df["Close"].iloc[-1])
+            price = hist_last
+
         df = add_indicators(df)
         supports, resistances = find_levels(df)
         liq = liquidity_info(df)
@@ -680,11 +713,23 @@ with tab1:
                 st.stop()
 
             n_all = len(scan_df)
+
+            # الإصلاح: الفلتر على متوسط 10 أيام (مستقر بالليل) —
+            # ولو متوسط مش متاح نرجع لقيمة آخر جلسة
+            if "avg_vol" not in scan_df.columns:
+                scan_df["avg_vol"] = 0.0
             if "value" not in scan_df.columns:
                 scan_df["value"] = scan_df["close"] * scan_df["volume"]
+            scan_df["avg_value"] = scan_df["close"] * scan_df["avg_vol"]
+
+            if (scan_df["avg_value"] > 0).any():
+                liq_col = "avg_value"
+            else:
+                liq_col = "value"
+
             scan_df = scan_df[(scan_df["close"] > 0) &
-                              (scan_df["value"] >= min_liq * 1e6)]
-            scan_df = scan_df.sort_values("value", ascending=False)
+                              (scan_df[liq_col] >= min_liq * 1e6)]
+            scan_df = scan_df.sort_values(liq_col, ascending=False)
             if scope == "كل السوق":
                 scan_df = scan_df.head(top_n)
             scan_df = scan_df.reset_index(drop=True)
