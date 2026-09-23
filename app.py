@@ -222,6 +222,11 @@ def find_levels(df, window=8, merge_pct=0.02, max_levels=4):
         if l == w["Low"].min():
             lows.append(l)
 
+    # ✅ إصلاح: استبعاد المستويات الميتة — اللي بعيدة عن السعر الحالي أكتر من 20%
+    last_close = float(df["Close"].iloc[-1])
+    lows = [l for l in lows if l >= last_close * 0.80]
+    highs = [h for h in highs if h <= last_close * 1.20]
+
     def cluster(levels):
         if not levels:
             return []
@@ -303,7 +308,12 @@ def decide(df, price, supports, resistances, liq):
 
     below = [s for s in supports if s < price]
     above = [r for r in resistances if r > price]
-    support = max(below) if below else round(price * 0.95, 2)
+    if below:
+        support = max(below)
+        real_support = True
+    else:
+        support = round(price * 0.95, 2)
+        real_support = False
     resistance = min(above) if above else round(price * 1.05, 2)
 
     near_support = (price - support) / price <= 0.02
@@ -323,12 +333,19 @@ def decide(df, price, supports, resistances, liq):
     if near_support:
         entry = (round(support * 1.001, 2), round(price, 2))
         entry_note = "عند الدعم — دخول مناسب دلوقتي"
+        ref_price = price
     else:
         entry = (round(support, 2), round(support * 1.02, 2))
-        entry_note = f"استنى السعر ينزل لمنطقة {entry[0]} - {entry[1]}"
+        if real_support:
+            entry_note = f"استنى السعر ينزل لمنطقة {entry[0]} - {entry[1]}"
+        else:
+            entry_note = (f"مفيش دعم واضح قريب — المنطقة {entry[0]} - {entry[1]} "
+                          "محسوبة تحته، والأفضل تستنى دعم حقيقي يتكوّن")
+        ref_price = entry[1]
 
+    # ✅ إصلاح: عائد/مخاطرة بيتحسب على سعر خطة الدخول، مش السعر الحالي
     stop_loss = round(support * 0.97, 2)
-    rr = round((resistance - price) / max(price - stop_loss, 0.01), 2)
+    rr = round((resistance - ref_price) / max(ref_price - stop_loss, 0.01), 2)
 
     if score >= 4:
         decision = "🟢 شراء"
@@ -537,7 +554,8 @@ def report(r):
         f"⚔️ **المقاومة (الهدف):** {r['resistance']}",
         f"🎯 **منطقة الدخول:** {r['entry'][0]} → {r['entry'][1]}",
         f"*{r['entry_note']}*",
-        f"🚨 **وقف الخسارة:** {r['stop_loss']} | ⚖️ عائد/مخاطرة: {r['rr']}",
+        (f"🚨 **وقف الخسارة:** {r['stop_loss']} | "
+         f"⚖️ عائد/مخاطرة: {r['rr']} *(محسوبة على خطة الدخول)*"),
         "---",
         f"💧 **السيولة:** {liq['rate']} — متوسط {fmt_num(liq['avg_value'])} ج/يوم",
         f"📦 **الكميات:** {fmt_num(liq['avg_vol'])} سهم/يوم",
