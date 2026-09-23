@@ -84,9 +84,14 @@ def data_quality_check(df):
         problems.append(f"⚠️ اتشالت {len(bad)} صف فيه سعر صفر أو ناقص")
         cleaned = cleaned.drop(bad.index)
 
-    zero_vol = cleaned[cleaned["Volume"].fillna(0) <= 0]
-    if len(zero_vol) > 3:
-        problems.append(f"⚠️ فيه {len(zero_vol)} يوم من غير كميات (موقوف؟)")
+    # 🔁 إصلاح: شمعة اليوم الفاضية قبل افتتاح السوق
+    # (سعرها = إغلاق أمس وكمياتها صفر — بتلعب على التغير والمؤشرات)
+    if len(cleaned) > 1:
+        last_vol = cleaned["Volume"].iloc[-1]
+        if pd.isna(last_vol) or float(last_vol) <= 0:
+            cleaned = cleaned.iloc[:-1]
+            problems.append("ℹ️ اتشالت شمعة يوم فاضي — غالباً السوق لسه ما افتحش "
+                            "(الحسابات على آخر يوم تداول حقيقي)")
 
     cleaned = cleaned.sort_index()
 
@@ -396,13 +401,13 @@ def analyze(symbol):
     if df_raw is None:
         raise ValueError("مفيش بيانات — اتأكد من الرمز")
 
-    # 🕵️ فحص الجودة والتنظيف
     df, quality_notes = data_quality_check(df_raw)
 
     last_d = df.index[-1].date()
     live_px, live_ts, live_src = get_fresh_price(symbol, last_d)
 
-    if live_px is not None:
+    # 🔁 إصلاح: متعدّلش شمعة جديدة غير لو فيه تداول فعلي النهاردة
+    if live_px is not None and live_ts.date() == now_cairo().date():
         price, psrc = live_px, live_src
         p_time = live_ts.strftime("%m-%d %H:%M")
         data_date = live_ts.date()
@@ -442,6 +447,11 @@ def scan_market():
     global SYMBOL_DESC
     q = (Query().set_markets("egypt")
          .select("name", "description", "close", "change", "volume", "type"))
+    # 🔁 إصلاح: رفع حد الـ 50 سهم الافتراضي عشان نجيب السوق كله
+    try:
+        q = q.limit(500)
+    except Exception:
+        pass
     _, df = q.get_scanner_data()
     if df is None or df.empty:
         return pd.DataFrame()
@@ -491,6 +501,7 @@ def scan_fallback_list(symbols):
         df, _ = get_hist_cached(s)
         if df is None:
             continue
+        df, _ = data_quality_check(df)
         try:
             px = float(df["Close"].iloc[-1])
             vol = float(df["Volume"].iloc[-1])
@@ -507,7 +518,14 @@ def deep_row(sym, price, vol_today):
         df, src = get_hist_cached(sym)
         if df is None:
             return None
-        df = patch_live(df.copy(), price)
+        df, _ = data_quality_check(df)
+        # 🔁 إصلاح: مفيش شمعة وهمية قبل الافتتاح — لو مفيش تداول النهاردة
+        # بنحسب على آخر يوم حقيقي والتغير يطلع بقيمة أمس مش صفر
+        if vol_today and vol_today > 0:
+            df = patch_live(df.copy(), price)
+        else:
+            df = df.copy()
+            price = float(df["Close"].iloc[-1])
         df = add_indicators(df)
         supports, resistances = find_levels(df)
         liq = liquidity_info(df)
@@ -517,280 +535,3 @@ def deep_row(sym, price, vol_today):
         except Exception:
             chg = 0.0
         val = price * (vol_today or 0)
-        if val <= 0:
-            val = liq["avg_value"]
-        return dict(sym=sym, price=price, chg=chg, val=val,
-                    score=d["score"], dec=d["decision"], d=d)
-    except Exception:
-        return None
-
-# ============ 7) جدول النتايج ============
-
-HEADERS = ["السهم", "السعر", "التغير", "سيولة اليوم", "الدرج", "القرار",
-           "الدعم", "المقاومة", "منطقة الدخول", "وقف الخسارة", "R/R", "ملاحظات"]
-
-def build_table(res):
-    if res is None or not len(res):
-        return pd.DataFrame(columns=HEADERS)
-    res = res.sort_values(["score", "val"], ascending=False)
-    rows = []
-    for r in res.itertuples():
-        d = r.d
-        notes = " • ".join(d["reasons"][:3]) if d["reasons"] else "—"
-        rows.append([
-            r.sym, f"{r.price:.2f}", f"{r.chg:+.1f}%",
-            fmt_num(r.val), f"{r.score:+d}", r.dec,
-            f"{d['support']:.2f}", f"{d['resistance']:.2f}",
-            f"{d['entry'][0]} – {d['entry'][1]}",
-            f"{d['stop_loss']:.2f}", f"{d['rr']:.1f}", notes])
-    return pd.DataFrame(rows, columns=HEADERS)
-
-# ============ 8) الرسم والتقرير ============
-
-def make_chart(r):
-    df = r["df"].tail(120)
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 6.5), sharex=True,
-                                   gridspec_kw={"height_ratios": [3, 1]})
-    ax1.plot(df.index, df["Close"], color="#1f77b4", lw=1.8, label="Price")
-    ax1.plot(df.index, df["SMA50"], color="#ff7f0e", lw=1.2, label="SMA50")
-    for s in r["supports"]:
-        ax1.axhline(s, color="green", ls="--", lw=1, alpha=0.7)
-        ax1.text(df.index[0], s, f" S{s:.1f}", color="green", fontsize=9, va="bottom")
-    for res in r["resistances"]:
-        ax1.axhline(res, color="red", ls="--", lw=1, alpha=0.7)
-        ax1.text(df.index[0], res, f" R{res:.1f}", color="red", fontsize=9, va="bottom")
-    ax1.axhspan(r["entry"][0], r["entry"][1], color="green", alpha=0.15)
-    ax1.axhline(r["price"], color="#2b6cb0", ls=":", lw=1.6, label="Now")
-    ax1.set_title(f"{r['symbol']} — Price / S / R")
-    ax1.legend(loc="upper left", fontsize=9)
-    ax1.grid(alpha=0.25)
-
-    vals = (df["Close"] * df["Volume"]) / 1e6
-    colors = ["#2ca02c" if c >= o else "#d62728"
-              for c, o in zip(df["Close"], df["Open"])]
-    ax2.bar(df.index, vals, color=colors, width=1.0)
-    ax2.set_ylabel("Value (M EGP)")
-    ax2.grid(alpha=0.25)
-    fig.tight_layout()
-    return fig
-
-def report(r):
-    liq = r["liq"]
-    desc = SYMBOL_DESC.get(r["symbol"], "")
-    head = f"### 📊 {r['symbol']}" + (f" — *{desc}*" if desc else "")
-    lines = [
-        head,
-        (f"**💰 السعر:** {r['price']:.2f} ج 🕒 *({r['p_time']})*"
-         f" | **RSI:** {r['rsi']} | **الدرج:** {r['score']:+d}"),
-        f"🗂 **المصدر:** {r['psrc']}",
-    ]
-    if r["stale"]:
-        lines.append(f"⚠️ **البيانات من {r['last_d']}** — تأخر {r['days_stale']} يوم عن النهاردة")
-    lines += [
-        f"## {r['decision']}", "---",
-        f"🛡️ **الدعم:** {r['support']}",
-        f"⚔️ **المقاومة (الهدف):** {r['resistance']}",
-        f"🎯 **منطقة الدخول:** {r['entry'][0]} → {r['entry'][1]}",
-        f"*{r['entry_note']}*",
-        (f"🚨 **وقف الخسارة:** {r['stop_loss']} | "
-         f"⚖️ عائد/مخاطرة: {r['rr']} *(محسوبة على خطة الدخول)*"),
-        "---",
-        f"💧 **السيولة:** {liq['rate']} — متوسط {fmt_num(liq['avg_value'])} ج/يوم",
-        f"📦 **الكميات:** {fmt_num(liq['avg_vol'])} سهم/يوم",
-        "---", "**الأسباب:**",
-    ]
-    lines += [f"- {x}" for x in r["reasons"]]
-
-    # 🕵️ قسم فحص البيانات — الشفافية الكاملة
-    lines += ["---", "### 🕵️ فحص البيانات"]
-    lines.append(f"**آخر 5 إغلاقات:** `{r['closes_preview']}`")
-    if r["quality_notes"]:
-        lines += ["**ملاحظات على البيانات:**"]
-        lines += [f"- {x}" for x in r["quality_notes"]]
-    else:
-        lines.append("- ✅ البيانات نظيفة — مفيش صفوف مكررة أو ناقصة")
-
-    lines += ["---", "⚠️ *تحليل تعليمي — مش نصيحة مالية*"]
-    return "\n".join(lines)
-
-# ============ 9) الواجهة ============
-
-if not ALL_STOCKS:
-    try:
-        ALL_STOCKS = fetch_all_symbols()
-    except Exception:
-        ALL_STOCKS = sorted(set(DEFAULT_WATCHLIST + FALLBACK_STOCKS))
-
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_watchlist()
-if "all_stocks" not in st.session_state:
-    st.session_state.all_stocks = ALL_STOCKS
-
-st.title("📈 محلل البورصة المصرية")
-st.caption("مسح السوق كامل + تحليل عميق — بيانات من TradingView مع رجوع تلقائي لـ Yahoo")
-
-tab1, tab2, tab3 = st.tabs(["🕵️ مسح السوق", "🔍 تحليل سهم واحد", "⭐ قايمتي"])
-
-# ---------- تاب المسح ----------
-with tab1:
-    c1, c2, c3 = st.columns(3)
-    scope = c1.selectbox("النطاق", ["كل السوق", "⭐ قايمتي"])
-    min_liq = c2.slider("أقل سيولة يومية (مليون ج)", 1, 50, 5)
-    top_n = c3.slider("عدد التحليل العميق", 5, 25, 15)
-
-    if st.button("🚀 ابدأ المسح", type="primary"):
-        status_ph = st.empty()
-        prog_ph = st.progress(0.0)
-        table_ph = st.empty()
-        summary_ph = st.empty()
-        try:
-            warn = ""
-            if scope == "كل السوق" and HAS_SCANNER:
-                status_ph.info("⏳ عم نجيب بيانات السوق...")
-                try:
-                    scan_df = scan_market()
-                except Exception:
-                    scan_df = None
-                if scan_df is None or scan_df.empty:
-                    warn = "⚠️ السكانر رجّع حاجة فاضية — قايمة بديلة محدودة\n\n"
-                    scan_df = scan_fallback_list(FALLBACK_STOCKS)
-            elif scope == "كل السوق":
-                warn = "⚠️ مكتبة السكانر مش متاحة — قايمة بديلة محدودة\n\n"
-                scan_df = scan_fallback_list(FALLBACK_STOCKS)
-            else:
-                if not st.session_state.watchlist:
-                    prog_ph.empty()
-                    st.warning("⚪ قايمتك فاضية — ضيف أسهم من تاب ⭐ قايمتي")
-                    st.stop()
-                scan_df = scan_fallback_list(list(st.session_state.watchlist))
-
-            if scan_df is None or scan_df.empty:
-                prog_ph.empty()
-                status_ph.error("❌ فشل المسح — جرب تاني")
-                st.stop()
-
-            n_all = len(scan_df)
-            if "value" not in scan_df.columns:
-                scan_df["value"] = scan_df["close"] * scan_df["volume"]
-            scan_df = scan_df[(scan_df["close"] > 0) &
-                              (scan_df["value"] >= min_liq * 1e6)]
-            scan_df = scan_df.sort_values("value", ascending=False)
-            if scope == "كل السوق":
-                scan_df = scan_df.head(top_n)
-            scan_df = scan_df.reset_index(drop=True)
-
-            if scan_df.empty:
-                prog_ph.empty()
-                status_ph.warning("⚪ مفيش أسهم فوق حد السيولة ده — قلل الحد")
-                st.stop()
-
-            rows, skipped = [], 0
-            total = len(scan_df)
-            for i, srow in enumerate(scan_df.itertuples(index=False), 1):
-                status_ph.info(f"{warn}⏳ ({i}/{total}) عم نحلل **{srow.sym}** ...")
-                prog_ph.progress(i / total)
-                row = deep_row(srow.sym, float(srow.close), float(srow.volume))
-                if row is None:
-                    skipped += 1
-                else:
-                    rows.append(row)
-                    table_ph.dataframe(build_table(pd.DataFrame(rows)),
-                                       use_container_width=True, hide_index=True)
-                time.sleep(0.15)
-
-            prog_ph.empty()
-            if not rows:
-                status_ph.error("❌ مفيش سهم اتحلل — مشكلة في جلب التاريخ")
-                st.stop()
-
-            res = pd.DataFrame(rows)
-            status_ph.markdown(
-                f"{warn}✅ **خلص المسح** — السوق: {n_all} سهم | فوق فلتر السيولة: {total} | "
-                f"اتحلل: {len(rows)} (اتخطى {skipped}) | ⏰ {now_cairo().strftime('%H:%M')}")
-            table_ph.dataframe(build_table(res),
-                               use_container_width=True, hide_index=True)
-
-            nbuy = int((res["score"] >= 4).sum())
-            nmid = int(((res["score"] >= 2) & (res["score"] < 4)).sum())
-            nsell = int((res["score"] <= -2).sum())
-            nneu = len(res) - nbuy - nmid - nsell
-
-            picks = res[res["score"] >= 2].sort_values("score", ascending=False).head(3)
-            if len(picks):
-                plines = ["", "**🎯 أعلى الفرص:**"]
-                for i2, r2 in enumerate(picks.itertuples(), 1):
-                    d2 = r2.d
-                    plines.append(
-                        f"{i2}. **{r2.sym}** — {r2.dec} | دخول {d2['entry'][0]}–{d2['entry'][1]}"
-                        f" | وقف {d2['stop_loss']} | هدف {d2['resistance']} | R/R {d2['rr']}")
-            else:
-                plines = ["", "**🎯 أعلى الفرص:** مفيش حاجة واضحة دلوقتي — الصبر أحسن"]
-
-            summary_ph.markdown(
-                "### 📋 الملخص\n"
-                f"🟢 شراء: **{nbuy}** | 🟡 شراء محتمل: **{nmid}** | "
-                f"⚪ محايد: **{nneu}** | 🔴 بيع: **{nsell}**\n"
-                + "\n".join(plines)
-                + "\n\n⚠️ *تحليل تعليمي — مش نصيحة مالية*")
-        except Exception as e:
-            prog_ph.empty()
-            status_ph.error(f"❌ حصلت مشكلة في المسح: {e}")
-
-# ---------- تاب التحليل الفردي ----------
-with tab2:
-    syms = st.session_state.all_stocks
-    if not syms:
-        st.warning("مفيش قايمة أسهم — دوس حدّث")
-    else:
-        rc1, rc2 = st.columns([3, 1])
-        idx = syms.index("COMI") if "COMI" in syms else 0
-        sym_sel = rc1.selectbox(f"اختار السهم — {len(syms)} سهم متاح",
-                                syms, index=idx)
-        sym_manual = rc2.text_input("أو اكتب رمز يدوي", placeholder="اختياري")
-        b1, b2 = st.columns([1, 3])
-        if b1.button("🔄 حدّث القايمة"):
-            st.session_state.all_stocks = fetch_all_symbols()
-            st.rerun()
-        if b2.button("🔍 حلّل", type="primary"):
-            symbol = (sym_manual or sym_sel).strip().upper()
-            if not symbol:
-                st.warning("اكتب رمز السهم الأول")
-            else:
-                with st.spinner(f"عم نحلل {symbol}..."):
-                    try:
-                        r = analyze(symbol)
-                        st.markdown(report(r))
-                        st.pyplot(make_chart(r))
-                        plt.close("all")
-                    except Exception as e:
-                        st.error(f"❌ حصلت مشكلة: {e}")
-
-# ---------- تاب القايمة ----------
-with tab3:
-    st.markdown("قايمتك المخصوصة — بتظهر كنطاق مسح في تاب 🕵️ (اختار ⭐ قايمتي)\n\n"
-                "💾 بتتحفظ طول ما التطبيق شغال")
-    wl = st.session_state.watchlist
-    st.info(f"القايمة فيها حالياً **{len(wl)}** سهم")
-    nc1, nc2 = st.columns([3, 1])
-    new_sym = nc1.text_input("ضيف سهم جديد", placeholder="مثال: ETEL")
-    if nc2.button("➕ إضافة", type="primary"):
-        s = new_sym.strip().upper()
-        if not s:
-            st.warning("اكتب الرمز الأول")
-        elif s in wl:
-            st.warning(f"{s} موجود في القايمة بالفعل")
-        else:
-            st.session_state.watchlist = save_watchlist(wl + [s])
-            st.rerun()
-    selected = st.multiselect("أسهم قايمتك — علّم على اللي عايز تحذفه", wl)
-    dc1, dc2 = st.columns(2)
-    if dc1.button("🗑️ حذف المحدد"):
-        if selected:
-            st.session_state.watchlist = save_watchlist(
-                [x for x in wl if x not in selected])
-            st.rerun()
-        else:
-            st.warning("علّم على الأسهم الأول")
-    if dc2.button("↩️ رجّع الافتراضي"):
-        st.session_state.watchlist = save_watchlist(DEFAULT_WATCHLIST)
-        st.rerun()
