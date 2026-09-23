@@ -65,6 +65,37 @@ def save_watchlist(wl):
         pass
     return wl
 
+# ============ فحص جودة البيانات 🕵️ ============
+
+def data_quality_check(df):
+    """بيفحص البيانات الخام ويرجع تقرير جودة + يرملها"""
+    problems = []
+    cleaned = df.copy()
+
+    n_before = len(cleaned)
+    cleaned = cleaned[~cleaned.index.duplicated(keep="last")]
+    n_dupes = n_before - len(cleaned)
+    if n_dupes > 0:
+        problems.append(f"⚠️ اتشالت {n_dupes} صف مكرر (عيب معروف في المصدر المجاني)")
+
+    bad = cleaned[(cleaned["Close"] <= 0) |
+                  cleaned[["Open", "High", "Low", "Close"]].isna().any(axis=1)]
+    if len(bad) > 0:
+        problems.append(f"⚠️ اتشالت {len(bad)} صف فيه سعر صفر أو ناقص")
+        cleaned = cleaned.drop(bad.index)
+
+    zero_vol = cleaned[cleaned["Volume"].fillna(0) <= 0]
+    if len(zero_vol) > 3:
+        problems.append(f"⚠️ فيه {len(zero_vol)} يوم من غير كميات (موقوف؟)")
+
+    cleaned = cleaned.sort_index()
+
+    return cleaned, problems
+
+def last_closes_str(df, n=5):
+    vals = [f"{v:.2f}" for v in df["Close"].tail(n)]
+    return " → ".join(vals)
+
 # ============ 1) جلب البيانات ============
 
 def flat_cols(t):
@@ -222,7 +253,6 @@ def find_levels(df, window=8, merge_pct=0.02, max_levels=4):
         if l == w["Low"].min():
             lows.append(l)
 
-    # ✅ إصلاح: استبعاد المستويات الميتة — اللي بعيدة عن السعر الحالي أكتر من 20%
     last_close = float(df["Close"].iloc[-1])
     lows = [l for l in lows if l >= last_close * 0.80]
     highs = [h for h in highs if h <= last_close * 1.20]
@@ -343,7 +373,6 @@ def decide(df, price, supports, resistances, liq):
                           "محسوبة تحته، والأفضل تستنى دعم حقيقي يتكوّن")
         ref_price = entry[1]
 
-    # ✅ إصلاح: عائد/مخاطرة بيتحسب على سعر خطة الدخول، مش السعر الحالي
     stop_loss = round(support * 0.97, 2)
     rr = round((resistance - ref_price) / max(ref_price - stop_loss, 0.01), 2)
 
@@ -363,9 +392,12 @@ def decide(df, price, supports, resistances, liq):
 
 def analyze(symbol):
     symbol = symbol.strip().upper()
-    df, src = get_hist_cached(symbol)
-    if df is None:
+    df_raw, src = get_hist_cached(symbol)
+    if df_raw is None:
         raise ValueError("مفيش بيانات — اتأكد من الرمز")
+
+    # 🕵️ فحص الجودة والتنظيف
+    df, quality_notes = data_quality_check(df_raw)
 
     last_d = df.index[-1].date()
     live_px, live_ts, live_src = get_fresh_price(symbol, last_d)
@@ -386,8 +418,14 @@ def analyze(symbol):
     liq = liquidity_info(df)
     d = decide(df, price, supports, resistances, liq)
 
+    days_stale = (now_cairo().date() - data_date).days
+
     return dict(symbol=symbol, price=price, psrc=psrc, p_time=p_time,
                 stale=data_date != now_cairo().date(),
+                days_stale=days_stale,
+                last_d=str(last_d),
+                quality_notes=quality_notes,
+                closes_preview=last_closes_str(df),
                 rsi=d["rsi"], support=d["support"],
                 resistance=d["resistance"], decision=d["decision"],
                 entry=d["entry"], entry_note=d["entry_note"],
@@ -547,7 +585,7 @@ def report(r):
         f"🗂 **المصدر:** {r['psrc']}",
     ]
     if r["stale"]:
-        lines.append("⚠️ **البيانات مش من النهاردة** (إجازة أو تأخير المصدر)")
+        lines.append(f"⚠️ **البيانات من {r['last_d']}** — تأخر {r['days_stale']} يوم عن النهاردة")
     lines += [
         f"## {r['decision']}", "---",
         f"🛡️ **الدعم:** {r['support']}",
@@ -562,6 +600,16 @@ def report(r):
         "---", "**الأسباب:**",
     ]
     lines += [f"- {x}" for x in r["reasons"]]
+
+    # 🕵️ قسم فحص البيانات — الشفافية الكاملة
+    lines += ["---", "### 🕵️ فحص البيانات"]
+    lines.append(f"**آخر 5 إغلاقات:** `{r['closes_preview']}`")
+    if r["quality_notes"]:
+        lines += ["**ملاحظات على البيانات:**"]
+        lines += [f"- {x}" for x in r["quality_notes"]]
+    else:
+        lines.append("- ✅ البيانات نظيفة — مفيش صفوف مكررة أو ناقصة")
+
     lines += ["---", "⚠️ *تحليل تعليمي — مش نصيحة مالية*"]
     return "\n".join(lines)
 
